@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jjboykin/chirpy/internal/auth"
 	"github.com/jjboykin/chirpy/internal/database"
 	"github.com/joho/godotenv"
 
@@ -206,9 +207,10 @@ func main() {
 		respondWithJSON(w, 201, respBody)
 	})
 
-	mux.HandleFunc("POST /api/users", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /api/login", func(w http.ResponseWriter, r *http.Request) {
 		type parameters struct {
-			Email string `json:"email"`
+			Email    string `json:"email"`
+			Password string `json:"password"`
 		}
 
 		decoder := json.NewDecoder(r.Body)
@@ -222,7 +224,54 @@ func main() {
 			return
 		}
 
-		user, err := apiCfg.db.CreateUser(r.Context(), params.Email)
+		user, err := apiCfg.db.GetUser(r.Context(), params.Email)
+		if err != nil {
+			respondWithError(w, 401, "Incorrect email or password")
+			return
+		}
+		err = auth.CheckPasswordHash(user.HashedPassword, params.Password)
+		if err != nil {
+			respondWithError(w, 401, "Incorrect email or password")
+			return
+		}
+		respBody := User{
+			ID:        user.ID,
+			CreatedAt: user.CreatedAt,
+			UpdatedAt: user.UpdatedAt,
+			Email:     user.Email,
+		}
+		respondWithJSON(w, 200, respBody)
+
+	})
+
+	mux.HandleFunc("POST /api/users", func(w http.ResponseWriter, r *http.Request) {
+		type parameters struct {
+			Email    string `json:"email"`
+			Password string `json:"password"`
+		}
+
+		decoder := json.NewDecoder(r.Body)
+		params := parameters{}
+		err := decoder.Decode(&params)
+		if err != nil {
+			// an error will be thrown if the JSON is invalid or has the wrong types
+			// any missing fields will simply have their values in the struct set to their zero value
+			log.Printf("Error decoding parameters: %s", err)
+			respondWithError(w, 500, "Something went wrong")
+			return
+		}
+
+		hashedPassword, err := auth.HashPassword(params.Password)
+		if err != nil {
+			respondWithError(w, 400, "Error creating user")
+			return
+		}
+		userParams := database.CreateUserParams{
+			Email:          params.Email,
+			HashedPassword: hashedPassword,
+		}
+
+		user, err := apiCfg.db.CreateUser(r.Context(), userParams)
 		if err != nil {
 			respondWithError(w, 400, "Error creating user")
 			return

@@ -8,3 +8,8 @@ email TEXT NOT NULL UNIQUE
 
 -- +goose Down
 DROP TABLE users;
+
+-- +goose Up
+ALTER TABLE users
+ADD hashed_password TEXT NOT NULL DEFAULT "unset"
+;
