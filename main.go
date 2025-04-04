@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -28,6 +29,7 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	db             *database.Queries
 	jwtSecret      string
+	polkaKey       string
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -60,23 +62,28 @@ type User struct {
 	Email        string    `json:"email"`
 	Token        string    `json:"token"`
 	RefreshToken string    `json:"refresh_token"`
+	IsChirpyRed  bool      `json:"is_chirpy_red"`
 }
 
 func main() {
 	godotenv.Load()
-
 	platform := os.Getenv("PLATFORM")
+	apiCfg := apiConfig{}
+
 	dbURL := os.Getenv("DB_URL")
-	jwtSecret := os.Getenv("JWT_SECRET")
 	db, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		log.Fatal(errors.New(err.Error()))
 		return
 	}
 	dbQueries := database.New(db)
-	apiCfg := apiConfig{}
 	apiCfg.db = dbQueries
+
+	jwtSecret := os.Getenv("JWT_SECRET")
 	apiCfg.jwtSecret = jwtSecret
+
+	polkaKey := os.Getenv("POLKA_KEY")
+	apiCfg.polkaKey = polkaKey
 
 	filepathRoot := "."
 	port := "8080"
@@ -90,11 +97,35 @@ func main() {
 	appHandler := http.StripPrefix("/app/", fsHandler)
 	mux.Handle("/app/", apiCfg.middlewareMetricsInc(appHandler))
 
-	mux.HandleFunc("GET /api/chirps", func(w http.ResponseWriter, req *http.Request) {
-		chirps, err := apiCfg.db.GetChirps(req.Context())
-		if err != nil {
-			respondWithError(w, 400, "Error returning chirps")
-			return
+	mux.HandleFunc("GET /api/chirps", func(w http.ResponseWriter, r *http.Request) {
+		var chirps []database.Chirp
+		var err error
+
+		authorID := r.URL.Query().Get("author_id")
+		if authorID != "" {
+			uuid, err := uuid.Parse(authorID)
+			if err != nil {
+				respondWithError(w, 400, "Invalid author_id")
+				return
+			}
+			chirps, err = apiCfg.db.GetChirpsByAuthor(r.Context(), uuid)
+			if err != nil {
+				respondWithError(w, 400, "Error returning chirps")
+				return
+			}
+		} else {
+			chirps, err = apiCfg.db.GetChirps(r.Context())
+			if err != nil {
+				respondWithError(w, 400, "Error returning chirps")
+				return
+			}
+		}
+
+		sortOrder := r.URL.Query().Get("sort")
+		if sortOrder == "desc" {
+			sort.Slice(chirps, func(i, j int) bool { return chirps[i].CreatedAt.After(chirps[j].CreatedAt) })
+		} else {
+			sort.Slice(chirps, func(i, j int) bool { return chirps[i].CreatedAt.Before(chirps[j].CreatedAt) })
 		}
 
 		respBody := []Chirp{}
@@ -318,6 +349,7 @@ func main() {
 			CreatedAt:    user.CreatedAt,
 			UpdatedAt:    user.UpdatedAt,
 			Email:        user.Email,
+			IsChirpyRed:  user.IsChirpyRed,
 			Token:        tokenString,
 			RefreshToken: refreshToken.Token,
 		}
@@ -374,7 +406,7 @@ func main() {
 	})
 
 	mux.HandleFunc("POST /api/users", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("POST /api/users handler called")
+
 		type parameters struct {
 			Email    string `json:"email"`
 			Password string `json:"password"`
@@ -408,16 +440,16 @@ func main() {
 		}
 
 		respBody := User{
-			ID:        user.ID,
-			CreatedAt: user.CreatedAt,
-			UpdatedAt: user.UpdatedAt,
-			Email:     user.Email,
+			ID:          user.ID,
+			CreatedAt:   user.CreatedAt,
+			UpdatedAt:   user.UpdatedAt,
+			Email:       user.Email,
+			IsChirpyRed: user.IsChirpyRed,
 		}
 		respondWithJSON(w, 201, respBody)
 	})
 
 	mux.HandleFunc("PUT /api/users", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("PUT /api/users handler called")
 		type parameters struct {
 			Email    string `json:"email"`
 			Password string `json:"password"`
@@ -450,25 +482,78 @@ func main() {
 			respondWithError(w, 400, "Error creating user")
 			return
 		}
-		userParams := database.UpdateUserParams{
+		userParams := database.UpdateUserAuthParams{
 			ID:             userID,
 			Email:          params.Email,
 			HashedPassword: hashedPassword,
 		}
 
-		user, err := apiCfg.db.UpdateUser(r.Context(), userParams)
+		user, err := apiCfg.db.UpdateUserAuth(r.Context(), userParams)
 		if err != nil {
 			respondWithError(w, 400, "Error updating user data")
 			return
 		}
 
 		respBody := User{
-			ID:        user.ID,
-			CreatedAt: user.CreatedAt,
-			UpdatedAt: user.UpdatedAt,
-			Email:     user.Email,
+			ID:          user.ID,
+			CreatedAt:   user.CreatedAt,
+			UpdatedAt:   user.UpdatedAt,
+			Email:       user.Email,
+			IsChirpyRed: user.IsChirpyRed,
 		}
 		respondWithJSON(w, 200, respBody)
+	})
+
+	mux.HandleFunc("POST /api/polka/webhooks", func(w http.ResponseWriter, r *http.Request) {
+		type data struct {
+			UserID string `json:"user_id"`
+		}
+
+		type parameters struct {
+			Event string `json:"event"`
+			Data  data   `json:"data"`
+		}
+
+		key, err := auth.GetAPIKey(r.Header)
+		if err != nil {
+			respondWithError(w, 401, "No valid API header")
+			return
+		}
+		if key != apiCfg.polkaKey {
+			respondWithError(w, 401, "API Key does not match")
+			return
+		}
+
+		decoder := json.NewDecoder(r.Body)
+		params := parameters{}
+		err = decoder.Decode(&params)
+		if err != nil {
+			// an error will be thrown if the JSON is invalid or has the wrong types
+			// any missing fields will simply have their values in the struct set to their zero value
+			log.Printf("Error decoding parameters: %s", err)
+			respondWithError(w, 500, "Something went wrong")
+			return
+		}
+
+		if params.Event != "user.upgraded" {
+			w.WriteHeader(204)
+			return
+		}
+
+		uuid, err := uuid.Parse(params.Data.UserID)
+		if err != nil {
+			respondWithError(w, 404, "Invalid userID")
+			return
+		}
+
+		user, err := apiCfg.db.UpdateUserChirpyRed(r.Context(), uuid)
+		if err != nil {
+			respondWithError(w, 400, "Error updating user data")
+			return
+		}
+		log.Printf("User with id=%s upgraded to is_chirpy_red=%v", user.ID, user.IsChirpyRed)
+		respBody := User{}
+		respondWithJSON(w, 204, respBody)
 	})
 
 	log.Printf("Serving files from %s/ on port: %s\n", filepathRoot, port)
